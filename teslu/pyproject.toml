@@ -1,0 +1,20 @@
+[project]
+name = "teslu"
+version = "0.1.0"
+authors = [
+    { name = "Ting-Chen Shang", email = "stryt2@gmail.com" },
+]
+description = "A simple personal Tesla scheduler for Sentry Mode."
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "cryptography~=46.0.3",
+    "loguru~=0.7.3",
+    "requests~=2.32.5",
+    "tesla-fleet-api~=1.4.0",
+]
+
+[dependency-groups]
+dev = [
+    "boto3~=1.42.21",
+]
