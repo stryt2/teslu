@@ -93,7 +93,7 @@ async def async_main(event: dict[str, str]):
     secrets = get_secrets()
 
     # Create temp key file for the signing library
-    tmp_directory = "./tmp"
+    tmp_directory = "/tmp"  # this is the only writable directory in AWS Lambda
     key_path = f"{tmp_directory}/private_key.pem"
     os.makedirs(tmp_directory, exist_ok=True)
     with open(key_path, "w") as f:
