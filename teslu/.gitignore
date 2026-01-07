@@ -1,0 +1,4 @@
+# Directories and files required for creating AWS Lambda Layers, see README.md
+packages/
+python/
+layer_content.zip
