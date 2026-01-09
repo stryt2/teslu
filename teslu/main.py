@@ -3,12 +3,17 @@ import math
 import os
 import pprint
 import time
+from typing import Any
 
 import aiohttp
 import boto3
+from dotenv import load_dotenv
 import requests
 from loguru import logger
+from retry import retry
 from tesla_fleet_api import TeslaFleetApi
+from tesla_fleet_api.exceptions import TeslaFleetError
+
 
 SSM_PREFIX = "/teslu"
 
@@ -17,10 +22,26 @@ TESLA_REGION = "na"
 TESLA_REGION_BASE_URL = "https://fleet-api.prd.na.vn.cloud.tesla.com"
 TESLA_AUTH_URL = "https://auth.tesla.com/oauth2/v3/token"
 
+# AWS Parameter Store
+IS_AWS_LAMBDA = "LAMBDA_TASK_ROOT" in os.environ
+
+load_dotenv()
+ssm = (
+    boto3.client("ssm")
+    if IS_AWS_LAMBDA
+    else boto3.Session(
+        profile_name=os.getenv("AWS_PROFILE"),
+        region_name=os.getenv("AWS_REGION"),
+    ).client("ssm")
+)
+
+
+# A custom exception to signal retrying later so that the retry decorator can catch it and retry.
+class RetryLater(Exception):
+    pass
+
 
 def get_secrets():
-    ssm = boto3.client("ssm")
-
     # Fetch all secrets in one call (limit is 10 per call, we are requesting 8)
     ssm_parameter_names = {
         "client_id",
@@ -61,9 +82,26 @@ def get_access_token(secrets):
 
     if response.status_code != 200:
         logger.error(f"Token Refresh Failed: {response.text}")
-        raise Exception("Could not refresh token")
+        raise Exception(f"Token Refresh Failed: {response.text}")
 
-    return response.json()["access_token"]
+    data = response.json()
+    access_token = data["access_token"]
+
+    new_refresh_token = data.get("refresh_token")
+
+    if new_refresh_token and new_refresh_token != secrets["refresh_token"]:
+        logger.debug("Refresh token has been rotated. Updating SSM Parameter...")
+        try:
+            ssm.put_parameter(
+                Name=f"{SSM_PREFIX}/refresh_token",
+                Value=new_refresh_token,
+                Type="SecureString",
+                Overwrite=True,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to update refresh token in SSM: {e}")
+
+    return access_token
 
 
 def is_at_home(current_lat, current_lon, home_lat, home_lon, home_radius_meters=10.0):
@@ -85,27 +123,74 @@ def is_at_home(current_lat, current_lon, home_lat, home_lon, home_radius_meters=
     return distance < home_radius_meters
 
 
-def is_aws_lambda() -> bool:
-    return "LAMBDA_TASK_ROOT" in os.environ
-
-
 def get_temp_directory() -> str:
     return (
         "/tmp"  # this is the only writable directory in AWS Lambda
-        if is_aws_lambda()
+        if IS_AWS_LAMBDA
         else "./tmp"
     )
 
 
+def is_vehicle_in_service(vehicle: dict) -> bool:
+    return vehicle["in_service"]
+
+
+def is_sentry_mode_available(vehicle_data: dict) -> bool:
+    return vehicle_data["vehicle_state"]["sentry_mode_available"]
+
+
+def is_sentry_mode_on(vehicle_data: dict) -> bool:
+    return vehicle_data["vehicle_state"]["sentry_mode"]
+
+
+def is_vehicle_in_park(vehicle_data: dict) -> bool:
+    return vehicle_data["drive_state"]["shift_state"] == "P"
+
+
+async def wake_up_vehicle(signed, prev_vehicle) -> dict[str, Any]:
+    round, max_rounds, vehicle = 0, 5, prev_vehicle
+    while vehicle["state"] != "online" and round < max_rounds:
+        round += 1
+        round_tag = f"{round}/{max_rounds}"
+        logger.debug(f"Vehicle is not online. Sending wake_up command... ({round_tag})")
+        await signed.wake_up()
+
+        # According to the doc, it may take 10-60s for the vehicle to connect.
+        t_0 = time.time()
+        while time.time() - t_0 <= 65.0:  # 60 seconds (plus a buffer) max wait
+            await asyncio.sleep(5)
+            vehicle = (await signed.vehicle())["response"]
+            if vehicle["state"] == "online":
+                logger.debug(
+                    f"Vehicle is now online after {int(time.time() - t_0)}s. ({round_tag})"
+                )
+                break
+            else:
+                logger.debug(
+                    f"Vehicle ({vehicle['state']=}) is still not online after "
+                    f"{int(time.time() - t_0)}s. Waiting for another 5s... ({round_tag})"
+                )
+
+    if vehicle["state"] != "online":
+        logger.error(
+            f"Vehicle failed to come online after {round} wake_up tries. Aborting."
+        )
+        raise RetryLater(
+            f"Vehicle failed to come online after {round} wake_up tries. Aborting."
+        )
+
+    return vehicle
+
+
 async def async_main(event: dict[str, str]):
-    logger.info("0. Determine target state...")
+    logger.info("Determine target state...")
     target_state = event.get("sentry", "on").lower()
     if target_state not in {"on", "off"}:
         logger.error(f"Invalid target Sentry Mode state: {target_state}")
         return {"status": "Error", "reason": "Invalid target state"}
     logger.debug(f"Target Sentry State: {target_state}")
 
-    logger.info("1. Fetching secrets...")
+    logger.info("Fetching secrets...")
     secrets = get_secrets()
 
     # Create temp key file for the signing library
@@ -128,94 +213,74 @@ async def async_main(event: dict[str, str]):
             await api.get_private_key(key_path)
             signed = api.vehicles.createSigned(vin=secrets["vin"])
 
-            logger.info("2. Ensuring vehicle is online...")
-            round, max_rounds = 0, 5
-
             vehicle = (await signed.vehicle())["response"]
-            while vehicle["state"] != "online" and round < max_rounds:
-                round += 1
-                round_tag = f"{round}/{max_rounds}"
-                logger.debug(
-                    f"Vehicle is not online. Sending wake_up command... ({round_tag})"
-                )
-                await signed.wake_up()
 
-                # According to the doc, it may take 10-60s for the vehicle to connect.
-                t_0 = time.time()
-                while time.time() - t_0 <= 65.0:  # 60 seconds (plus a buffer) max wait
-                    await asyncio.sleep(5)
-                    vehicle = (await signed.vehicle())["response"]
-                    if vehicle["state"] == "online":
-                        logger.debug(
-                            f"Vehicle is now online after {int(time.time() - t_0)}s. ({round_tag})"
-                        )
-                        break
-                    else:
-                        logger.debug(
-                            f"Vehicle ({vehicle['state']=}) is still not online after "
-                            f"{int(time.time() - t_0)}s. Waiting for another 5s... ({round_tag})"
-                        )
-
-            if vehicle["state"] != "online":
-                logger.error(
-                    f"Vehicle failed to come online after {round} wake_up tries. Aborting."
-                )
-                return {"status": "Error", "reason": "Vehicle cannot be woken up."}
-
-            vehicle_data = (
-                await signed.vehicle_data(
-                    endpoints=["location_data", "vehicle_state", "drive_state"]
-                )
-            )["response"]
-
-            is_sentry_mode_available = vehicle_data["vehicle_state"][
-                "sentry_mode_available"
-            ]
-            is_sentry_mode_on = vehicle_data["vehicle_state"]["sentry_mode"]
-            vehicle_lat = vehicle_data["drive_state"]["latitude"]
-            vehicle_lon = vehicle_data["drive_state"]["longitude"]
-            shift_state = vehicle_data["drive_state"].get("shift_state")
-
-            logger.info("3. Validating vehicle state...")
-            if vehicle["in_service"]:
+            logger.info("Ensuring vehicle is not in service mode...")
+            if is_vehicle_in_service(vehicle):
                 logger.warning("Vehicle is in service mode. Skipping.")
                 return {"status": "Skipped", "reason": "Vehicle in service mode"}
 
-            if not is_sentry_mode_available:
+            logger.info("Ensuring vehicle is online...")
+            vehicle = await wake_up_vehicle(signed, vehicle)
+
+            # Now that the vehicle is online, fetch the vehicle data.
+            vehicle_data = (
+                await signed.vehicle_data(
+                    endpoints=[
+                        "charge_state",
+                        "location_data",
+                        "vehicle_state",
+                        "drive_state",
+                    ]
+                )
+            )["response"]
+
+            logger.info("Ensuring Sentry Mode is available...")
+            if not is_sentry_mode_available(vehicle_data):
                 logger.warning("Sentry Mode NOT available on this vehicle. Skipping.")
                 return {"status": "Skipped", "reason": "Sentry Mode not available"}
 
-            desired_sentry_status = target_state == "on"
-            if is_sentry_mode_on == desired_sentry_status:
+            logger.info("Checking current Sentry Mode status vs. target state...")
+            if is_sentry_mode_on(vehicle_data) == (target_state == "on"):
                 logger.info(f"Sentry Mode already {target_state}. No action needed.")
                 return {"status": "Skipped", "reason": "Already in desired state"}
 
-            if shift_state and shift_state != "P":
-                logger.warning(f"Car is not in Park ({shift_state=}). Skipping.")
-                return {"status": "Skipped", "reason": "Car not in Park"}
-
-            logger.info("4. Validating geofence...")
+            # Do different validation based on target state. Reason being that if we are turning on
+            # Sentry Mode, we don't need to check geofence and shift state because we are increasing
+            # security.
             if target_state == "on":
-                logger.debug("Target state is ON. Skipping geofence check.")
+                # TODO: Do battery level check
+                logger.info(
+                    "Skipping geofence and shift state check for turning ON Sentry Mode..."
+                )
             else:
-                home_radius = float(secrets["home/effective_radius"])
-                home_lat = float(secrets["home/latitude"])
-                home_lon = float(secrets["home/longitude"])
-                if target_state == "off" and not is_at_home(
-                    vehicle_lat, vehicle_lon, home_lat, home_lon, home_radius
+                logger.info("Ensuring vehicle is in Park...")
+                if not is_vehicle_in_park(vehicle_data):
+                    shift_state = vehicle_data["drive_state"]["shift_state"]
+                    logger.warning(f"Car is not in Park ({shift_state=}). Skipping.")
+                    return {"status": "Skipped", "reason": "Car not in Park"}
+
+                logger.info("Ensuring vehicle is at home...")
+                if not is_at_home(
+                    current_lat=vehicle_data["drive_state"]["latitude"],
+                    current_lon=vehicle_data["drive_state"]["longitude"],
+                    home_lat=float(secrets["home/latitude"]),
+                    home_lon=float(secrets["home/longitude"]),
+                    home_radius_meters=float(secrets["home/effective_radius"]),
                 ):
-                    logger.info(
-                        "Target state is OFF but the car is NOT at home. No action taken."
-                    )
+                    logger.info("The car is NOT at home. No action taken.")
                     return {"status": "Skipped", "reason": "Not at home"}
 
-            logger.info(f"5. Setting Sentry Mode to: {target_state.upper()}...")
-            response = (await signed.set_sentry_mode(on=desired_sentry_status))[
-                "response"
-            ]
+            logger.info(
+                f"All validations passed. Setting Sentry Mode to: {target_state.upper()}..."
+            )
+            on = target_state == "on"
+            response = (await signed.set_sentry_mode(on=on))["response"]
             if not response["result"]:
                 logger.error(f"Failed to set Sentry Mode: {pprint.pformat(response)}")
-                return {"status": "Error", "reason": "API command failed."}
+                raise RetryLater(
+                    f"Failed to set Sentry Mode: {pprint.pformat(response)}"
+                )
 
             logger.info(f"Sentry Mode set successfully to {target_state.upper()}.")
             return {"status": "Success", "sentry_mode": target_state}
@@ -225,6 +290,9 @@ async def async_main(event: dict[str, str]):
             os.remove(key_path)
 
 
+# Retry up to 5 times on TeslaFleetError and RetryLater, sleep 1, 2, 4, 8, 16 seconds between
+# attempts.
+@retry((TeslaFleetError, RetryLater), tries=5, delay=1, backoff=2)
 def lambda_handler(event, context):
     return asyncio.run(async_main(event))
 

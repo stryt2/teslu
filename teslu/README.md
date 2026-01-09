@@ -18,6 +18,7 @@ But with some tweaks because it seems like the layer structure created as above 
  `python/lib/site-packages`:
 
 ```powershell
+uv export --frozen --no-dev --no-editable -o requirements.txt
 uv pip install `
   --no-installer-metadata `
   --no-compile-bytecode `
@@ -30,7 +31,28 @@ uv pip install `
 2. Zip the `python` folder contents into `layer_content.zip`:
 
 ```powershell
-Compress-Archive -Path python\* -DestinationPath layer_content.zip -Force
+Compress-Archive -Path python -DestinationPath layer_content.zip -Force
+```
+
+# Manually Fetching Tesla Refresh Token
+
+Go to the link below in your browser:
+
+https://auth.tesla.com/oauth2/v3/authorize?client_id=[CLIENT_ID]&locale=en-US&prompt=login&redirect_uri=https%3A%2F%2Fapp.teslu.store%2Fcallback&response_type=code&scope=openid%20offline_access%20user_data%20vehicle_device_data%20vehicle_cmds%20vehicle_charging_cmds%20vehicle_location&state=[RANDOM_STATE_STRING]
+
+```powershell
+$TokenBody = @{
+  grant_type    = "authorization_code"
+  client_id     = "<CLIENT_ID>"
+  client_secret = "<CLIENT_SECRET>"
+  code          = "<AUTHORIZATION_CODE>"  # The code you get from the URL after log in when visiting the above link
+  audience      = "https://fleet-api.prd.na.vn.cloud.tesla.com"
+  redirect_uri  = "https://app.teslu.store/callback"
+}
+
+$Response = Invoke-RestMethod -Uri "https://auth.tesla.com/oauth2/v3/token" -Method Post -Body $TokenBody
+
+$Response
 ```
 
 # Copyright Notice
