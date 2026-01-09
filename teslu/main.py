@@ -247,12 +247,20 @@ async def async_main(event: dict[str, str]):
 
             # Do different validation based on target state. Reason being that if we are turning on
             # Sentry Mode, we don't need to check geofence and shift state because we are increasing
-            # security.
+            # security, but we do need to ensure we don't turn it on when battery is already low.
             if target_state == "on":
-                # TODO: Do battery level check
                 logger.info(
                     "Skipping geofence and shift state check for turning ON Sentry Mode..."
                 )
+
+                logger.info("Ensuring vehicle is not low on battery...")
+                if vehicle_data["charge_state"]["usable_battery_level"] < 15:
+                    battery_level = vehicle_data["charge_state"]["usable_battery_level"]
+                    logger.warning(
+                        f"Battery level is too low ({battery_level}%). Skipping."
+                    )
+                    return {"status": "Skipped", "reason": "Battery level too low"}
+
             else:
                 logger.info("Ensuring vehicle is in Park...")
                 if not is_vehicle_in_park(vehicle_data):
